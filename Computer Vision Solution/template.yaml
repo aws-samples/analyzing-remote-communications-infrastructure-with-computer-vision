@@ -1,0 +1,392 @@
+# CloudFormation template for the Computer Vision Solution.
+# This temaplates builds all the required infrastructure needed to call the SageMaker endpoints with the trained labeling models.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Deploys the resources for a serverless image labeling solution based around a customizable number of SageMaker endpoints."
+
+Parameters:
+  ResourcesPublicBucketName:
+    Type: "String"
+    Default: "computer-vision-resources-public"
+    Description: "Name of the S3 bucket with the lambda packages containing all functions and layers."
+
+  SourceBucketName:
+    Type: "String"
+    Default: "computer-vision-images"
+    Description: "Name for S3 bucket to upload photos and store labeled images."
+
+  TableName:
+    Type: "String"
+    Default: "computerVisionResults"
+    Description: "Name of the DynamoDB table to store the results."
+
+  EndpointConfigValue:
+    Type: "String"
+    Default: |
+      {
+        "endpoints_config": [
+          {
+            "ep_name": "YOUR ENDPOINT NAME",
+            "db_key": "bee",
+            "labels": ["bee"],
+            "threshold": 0.65
+          }
+        ]
+      }
+    Description: "The first value to populate the endpoint_config parameter in the parameter store. The default value contains a sample configuration for a bee detecting model."
+
+Resources:
+  S3Bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref SourceBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+            BucketKeyEnabled: false
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:Put"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: "Prefix"
+                    Value: "raw_images/"
+                  - Name: "Suffix"
+                    Value: ".jpg"
+            Queue: !GetAtt SQSImageQueue.Arn
+
+  DynamoDBTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "image_name"
+          AttributeType: "S"
+      TableName: !Ref TableName
+      KeySchema:
+        - AttributeName: "image_name"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  SQSImageQueue:
+    Type: "AWS::SQS::Queue"
+    Properties:
+      MessageRetentionPeriod: 300
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 3600
+      QueueName: "ImageQueue"
+
+  SQSS3NotificationPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SQSImageQueue
+      PolicyDocument:
+        Statement:
+          - Effect: "Allow"
+            Sid: PutS3Events
+            Action: SQS:SendMessage
+            Resource: !GetAtt SQSImageQueue.Arn
+            Principal:
+              Service: s3.amazonaws.com
+
+  LambdaTriggerStateMachine:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      Code:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "triggerStateMachine.zip"
+      Description: " Gets called by the SQS queue when a new image is uploaded to the raw images path. Parses the SQS message and passes it as an event to state machine. Starts the state machine execution."
+      MemorySize: 128
+      Timeout: 3
+      Role: !GetAtt RoleLambdaTriggerStateMachine.Arn
+
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt SQSImageQueue.Arn
+      FunctionName: !GetAtt LambdaTriggerStateMachine.Arn
+
+  StepFunctionsOrchestrator:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      Definition:
+        Comment: "Triggered by SQS. Orchestrates the computer vision process from preparing the images, gathering endpoints, getting model predictions, to labeling images and storing the results"
+        StartAt: Prepare
+        States:
+          Prepare:
+            Type: Task
+            Resource: !GetAtt LambdaPrepare.Arn
+            Next: GetEndpoints
+          GetEndpoints:
+            Type: Task
+            Resource: !GetAtt LambdaGetEndpoints.Arn
+            Next: CallEndpoints
+          CallEndpoints:
+            Type: Map
+            ItemsPath: "$.endpoints"
+            MaxConcurrency: 10
+            Iterator:
+              StartAt: CallEndpoint
+              States:
+                CallEndpoint:
+                  Type: Task
+                  Resource: !GetAtt LambdaCallEndpoint.Arn
+                  End: true
+            Next: LabelAndSave
+          LabelAndSave:
+            Type: Task
+            Resource: !GetAtt LambdaLabelAndSave.Arn
+            End: true
+      RoleArn: !GetAtt RoleStepFunctionsOrchestrator.Arn
+      StateMachineName: ComputerVisionOrchestrator
+      StateMachineType: STANDARD
+
+  LambdaPrepare:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Code:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "prepare.zip"
+      Description: "Function in Step Functions. Downloads the uploaded image from S3, resizes it, and reuploads it with a new key in the same bucket. Passes the new path, bucket, and image name."
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt RoleLambdaPrepare.Arn
+      Layers:
+        - !Ref LambdaPillowLayer
+
+  LambdaGetEndpoints:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Code:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "getEndpoints.zip"
+      Description: "Function in Step Functions. Uses the Systems Manager Parameter Store to get the endpoints config JSON and the DynamoDB table name and passes them to the mapping step in step functions."
+      MemorySize: 128
+      Timeout: 3
+      Role: !GetAtt RoleLambdaGetEndpoints.Arn
+
+  LambdaCallEndpoint:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Code:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "callEndpoint.zip"
+      Description: "Function in Step Functions. Mapping step calls this function for each endpoint passed in the event. Downloads and converts resized image to tensor and calls the endpoint. Parses and stores the results in DynamoDB."
+      MemorySize: 2048
+      Timeout: 60
+      Role: !GetAtt RoleLambdaCallEndpoint.Arn
+      Layers:
+        - !Ref LambdaCVLayer
+
+  LambdaLabelAndSave:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Code:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "labelAndSave.zip"
+      Description: "Function in Step Functions. Downloads the resized image, gets its results from DynamoDB, labels the image, and stores a labeled version in the S3 source bucket"
+      MemorySize: 128
+      Timeout: 3
+      Role: !GetAtt RoleLambdaLabelAndSave.Arn
+      Layers:
+        - !Ref LambdaPillowLayer
+        - !Ref LambdaFontLayer
+
+  LambdaPillowLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      Description: "Used for image manipulation and editing"
+      LayerName: "pillow"
+      Content:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "PillowLayer.zip"
+      CompatibleRuntimes:
+        - python3.12
+        - python3.11
+
+  LambdaCVLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      Description: "Used to convert image to tensor"
+      LayerName: "openCV-headless"
+      Content:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "OpenCVHeadlessLayer.zip"
+      CompatibleRuntimes:
+        - python3.12
+        - python3.11
+
+  LambdaFontLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      Description: "Used for labeling images"
+      LayerName: "font"
+      Content:
+        S3Bucket: !Ref ResourcesPublicBucketName
+        S3Key: "FontLayer.zip"
+      CompatibleRuntimes:
+        - python3.12
+        - python3.11
+
+  RoleLambdaTriggerStateMachine:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::Region}-triggerStateMachineRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
+        - "arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess"
+
+  RoleLambdaPrepare:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::Region}-prepareRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+
+  RoleLambdaGetEndpoints:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::Region}-getEndpointsRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess"
+
+  RoleLambdaCallEndpoint:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::Region}-callEndpointRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+        - "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+
+  RoleLambdaLabelAndSave:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::Region}-labelAndSaveRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBReadOnlyAccess"
+
+  RoleStepFunctionsOrchestrator:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::Region}-StepFunctionsOrchestratorRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt LambdaPrepare.Arn
+                  - !GetAtt LambdaGetEndpoints.Arn
+                  - !GetAtt LambdaCallEndpoint.Arn
+                  - !GetAtt LambdaLabelAndSave.Arn
+
+  SSMParameterQueueURL:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "SQS_URL"
+      Type: "String"
+      Value: !Ref SQSImageQueue
+      DataType: "text"
+      Description: "The SQS URL. Used from Lambda to delete the SQS messages after they've been processed."
+      Tier: "Standard"
+
+  SSMParameterOrchestratorARN:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "state_machine_ARN"
+      Type: "String"
+      Value: !GetAtt StepFunctionsOrchestrator.Arn
+      DataType: "text"
+      Description: "Orchestrator Arn. Used by the TriggerStateMachine function to start the orchestrator."
+      Tier: "Standard"
+
+  SSMParameterTableName:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "table_name"
+      Type: "String"
+      Value: !Ref TableName
+      DataType: "text"
+      Description: "Name of the DynamoDB table to store the results."
+      Tier: "Standard"
+
+  SSMParameterEndpointConfig:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "endpoint_config"
+      Type: "String"
+      Value: !Ref EndpointConfigValue
+      DataType: "text"
+      Description: "Contains the configuration for each endpoint deployed, including: name, key, labels, and threshold."
+      Tier: "Standard"
