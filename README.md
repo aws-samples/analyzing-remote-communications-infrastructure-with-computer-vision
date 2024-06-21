@@ -19,7 +19,9 @@ To use this solution, an AWS account with access and permissions to deploy the f
 
 ### Before you begin
 
-We provide all the necessary code for the functions and layers, and a CloudFormation template that deploys all the required resources for you. This architecture is built around an existing, running endpoint model, so we provide the instructions and resources to launch a sample one before deploying the CloudFormation stack.
+We provide all the necessary code for the functions and layers, and a CloudFormation template that deploys all the required resources for you. 
+
+To keep this post concise, we do not cover all the stages involved in model development and provisioning. Instead, *we assume that you already have a model trained*. If you would like more information and guidance about how to leverage AWS services to build, train, and deploy your own computer vision endpoints, then you can review these computer vision resources in the Amazon SageMaker developer guide. You can also view this Amazon ML post, which covers an entire deployment example that includes the use of Amazon GroundTruth for labeling training data. You can use the endpoint deployed in that post to test the solution presented here.
 
 If you already have available endpoints, then you may skip ahead to the CloudFormation step. However, since different models differ in their expected inputs and outputs, remember that you probably need to change the code in the functions to fit the input format and parameters of your own endpoints.
 
@@ -31,8 +33,8 @@ You should have the following files:
 
 - `template.yaml`: the CloudFormation template
 - `deploy_sample_endpoint.ipynb`: a Jupyter notebook to deploy an the endpoint. You will need a `model.tar.gz`: the parameters for our trained model so we don’t need to train one
-- `model.tar.gz`: the parameters for our trained model so we don’t need to train one
-- Five Lambda functions
+- `model.tar.gz`: the parameters for our trained model so we don’t need to train one. If you already have an endpoint running you do not need this file.
+- Five Lambda functions zipped and named as follows. To create these files, you can run the `zip_lambas.py` script by navigating to the `lambdas` folder and running the command `python zip_lambdas.py`.
   - `triggerStateMachine.zip`
   - `prepare.zip`
   - `getEndpoints.zip`
@@ -78,7 +80,7 @@ For our sample model, we deploy an already trained model to recognize bees from 
    - Locate the _deploy_sample_endpoint.ipynb_ in your local machine and open it. Once it appears in the left panel, double-click the file to open the notebook.
    - From the dropdown, select **conda_tensorflow2_p310** for the Kernel and select **Select**.
    - Note that you need to copy the Amazon S3 URI of the _model.tar.gz_ that you uploaded earlier and paste it into the model_artifact line in the second cell.
-   - Run the first four cells of notebook but do not run the last cell so you DON’T DELETE THE ENDPOINT.
+   - Run the first four cells of notebook but **do not run the last cell**.
      - Note that, depending on your [AWS Region](https://aws.amazon.com/about-aws/global-infrastructure/regions_az/), the ml.m5.xlarge instance may not be available. If that's the case and you get an error, then try a similar instance. For example, ml.g5.2xlarge.
    - Back in the Console, navigate back to SageMaker and in the left panel select **Inference > Endpoints** to see the endpoint being deployed. Wait until the endpoint status goes from Creating to _InService_.
    - Copy the _Name_ (not the ARN) of the endpoint and save it somewhere or continue the next steps on a separate window so you have the name available.
@@ -87,7 +89,7 @@ For our sample model, we deploy an already trained model to recognize bees from 
 
 1. In the Console, navigate to CloudFormation.
 2. Select **Create stack**.
-3. Select **Template is ready** and for the source choose **Amazon S3 URL**.
+3. Select **Choose an existing template** and for the source choose **Amazon S3 URL**.
 4. Locate the _template.yaml_ file in the resources bucket and copy its URL (not the URI), then paste it into the Amazon S3 URL field.
 5. Select **Next**.
 6. In _Specify stack details_
